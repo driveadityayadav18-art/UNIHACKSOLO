@@ -17,10 +17,12 @@ st.caption("Upload a catalog or paste product text. Generated records preserve t
 
 with st.sidebar:
     st.header("Pipeline controls")
-    use_llm = st.checkbox("Enable optional Groq AI enrichment", value=False, help="Uses GROQ_API_KEY and GROQ_MODEL when enabled. Keep off for deterministic local processing.")
+    use_llm = st.checkbox("Enable optional Groq AI enrichment", value=False, help="Uses GROQ_API_KEY and GROQ_MODEL when enabled. Keep off for instant deterministic local processing.")
+    llm_limit = st.number_input("Rows for AI enrichment", min_value=1, max_value=100, value=5, step=1, disabled=not use_llm, help="Enriches the first N rows with Groq AI so batch uploads complete quickly.")
     research_sources = st.checkbox("Research public sources", value=False, help="Searches public web results and retrieves readable HTML/PDF evidence. Start with a small limit.")
     research_limit = st.number_input("Rows to research", min_value=0, max_value=100, value=5, step=1, disabled=not research_sources)
-    st.info("The sample input contains 1,000 source rows with 6 columns. The expected delivery file contains 252 columns.")
+    st.divider()
+    st.info("💡 **Performance Note:** Offline deterministic mode processes all 1,000 rows in ~1 second. AI Enrichment & Public Research are applied to the first N rows selected above.")
 
 uploaded = st.file_uploader("Upload CSV, TXT, or PDF", type=["csv", "txt", "pdf"])
 text_input = st.text_area("Or paste raw product text", height=150, placeholder="Example: 3M 775L Stikit Film P150 - Cubitron II 50 Disc/Box")
@@ -30,12 +32,30 @@ if st.button("Process products", type="primary"):
         st.error("Upload a file or paste product text first.")
     else:
         try:
-            with st.spinner("Running ingestion, extraction, enrichment, and validation..."):
-                payload = uploaded.getvalue() if uploaded else None
-                filename = uploaded.name if uploaded else "text-input.txt"
-                result = Orchestrator(use_llm=use_llm, research_sources=research_sources, research_limit=int(research_limit)).process(payload=payload, filename=filename, text=text_input or None)
+            progress_holder = st.empty()
+            progress_bar = progress_holder.progress(0, text="Starting ingestion and extraction...")
+            
+            def on_progress(current: int, total: int):
+                pct = min(1.0, current / max(1, total))
+                progress_bar.progress(pct, text=f"Processing row {current:,} of {total:,}...")
+
+            payload = uploaded.getvalue() if uploaded else None
+            filename = uploaded.name if uploaded else "text-input.txt"
+            orchestrator = Orchestrator(
+                use_llm=use_llm,
+                llm_limit=int(llm_limit),
+                research_sources=research_sources,
+                research_limit=int(research_limit)
+            )
+            result = orchestrator.process(
+                payload=payload,
+                filename=filename,
+                text=text_input or None,
+                progress_callback=on_progress
+            )
+            progress_holder.empty()
             st.session_state["result"] = result
-            st.success(f"Processed {len(result['records']):,} product row(s).")
+            st.success(f"Successfully processed {len(result['records']):,} product row(s) into 252 delivery columns.")
         except Exception as exc:
             st.exception(exc)
 

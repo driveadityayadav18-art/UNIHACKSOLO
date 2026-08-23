@@ -45,13 +45,39 @@ except ImportError:  # pragma: no cover - optional at runtime
 
 
 def build_structured_chat_model():
-    """Create a configured Groq or OpenAI model using environment variables only."""
+    """Create a configured Groq or OpenAI model using environment variables or Streamlit secrets."""
     provider = os.getenv("LLM_PROVIDER", "groq").lower().strip()
     if provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            try:
+                import streamlit as st
+                api_key = st.secrets.get("GROQ_API_KEY")
+            except Exception:
+                pass
         from langchain_groq import ChatGroq
-        return ChatGroq(model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+        return ChatGroq(
+            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            temperature=0,
+            api_key=api_key or "missing-groq-key",
+            max_retries=1,
+            timeout=10,
+        )
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("OPENAI_API_KEY")
+        except Exception:
+            pass
     from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        api_key=api_key or "missing-openai-key",
+        max_retries=1,
+        timeout=10,
+    )
 
 
 @dataclass
@@ -258,7 +284,7 @@ class EnrichmentAgent:
         self.knowledge_base = knowledge_base or LocalKnowledgeBase()
         self.use_llm = bool(use_llm) if use_llm is not None else os.getenv("USE_LLM_ENRICHMENT", "false").lower() == "true"
 
-    def enrich(self, record: Dict[str, Optional[str]], traces: Dict[str, FieldTrace], source: Dict[str, str]) -> Tuple[Dict[str, Optional[str]], Dict[str, FieldTrace]]:
+    def enrich(self, record: Dict[str, Optional[str]], traces: Dict[str, FieldTrace], source: Dict[str, str], run_llm: bool = False) -> Tuple[Dict[str, Optional[str]], Dict[str, FieldTrace]]:
         query = " ".join(str(source.get(key, "")) for key in INPUT_HEADERS)
         neighbors = self.knowledge_base.search(query, k=3)
         nearest = neighbors[0][1] if neighbors and neighbors[0][0] >= 0.15 else None
@@ -269,16 +295,23 @@ class EnrichmentAgent:
             record["BRAND_NAME"] = value
             traces["BRAND_NAME"] = FieldTrace(value=value, confidence_score=0.66, source="local knowledge base", source_excerpt=str(nearest)[:240], reasoning="Borrowed a brand only from the nearest catalog row; flagged for human review because similarity is indirect.", status="enriched")
 
-        if self.use_llm:
+        if run_llm or (self.use_llm and run_llm is True):
             self._optional_llm_enrich(record, traces, source)
         return record, traces
 
     def _optional_llm_enrich(self, record: Dict[str, Optional[str]], traces: Dict[str, FieldTrace], source: Dict[str, str]) -> None:
         """Call the selected LangChain provider only when explicitly enabled."""
+        if not os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+            try:
+                import streamlit as st
+                if not st.secrets.get("GROQ_API_KEY") and not st.secrets.get("OPENAI_API_KEY"):
+                    return
+            except Exception:
+                return
         try:
             from langchain_core.messages import HumanMessage
             chat_model = build_structured_chat_model()
-        except ImportError:
+        except Exception:
             return
         missing = [key for key in ("MARKETING_DESCRIPTION", "LONG_DESC1", "Application", "Includes") if is_missing(record.get(key))]
         if not missing:
@@ -427,16 +460,17 @@ class ValidationAgent:
 class Orchestrator:
     """Runs Ingestion -> Extraction -> Enrichment -> Validation."""
 
-    def __init__(self, use_llm: Optional[bool] = None, research_sources: bool = False, research_limit: int = 5):
+    def __init__(self, use_llm: Optional[bool] = None, research_sources: bool = False, research_limit: int = 5, llm_limit: int = 5):
         self.ingestion = IngestionAgent()
         self.extraction = ExtractionAgent()
-        self.use_llm = use_llm
+        self.use_llm = bool(use_llm)
+        self.llm_limit = max(0, int(llm_limit))
         self.research_sources = research_sources
         self.research_limit = max(0, int(research_limit))
         self.source_research = SourceResearchAgent(use_llm=bool(use_llm))
         self.validation = ValidationAgent()
 
-    def process(self, payload: Optional[bytes] = None, filename: str = "", text: Optional[str] = None, rows: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    def process(self, payload: Optional[bytes] = None, filename: str = "", text: Optional[str] = None, rows: Optional[List[Dict[str, str]]] = None, progress_callback: Optional[Any] = None) -> Dict[str, Any]:
         ingestion = IngestionResult(rows=rows, raw_text="", filename="rows") if rows is not None else self.ingestion.ingest(payload=payload, filename=filename, text=text)
         kb = LocalKnowledgeBase(ingestion.rows)
         enrichment = EnrichmentAgent(kb, use_llm=self.use_llm)
@@ -444,9 +478,11 @@ class Orchestrator:
         traceability: List[ProductTraceability] = []
         validation_reports: List[ValidationReport] = []
         research_results: List[Dict[str, Any]] = []
+        total_rows = len(ingestion.rows)
         for index, source in enumerate(ingestion.rows):
             record, traces = self.extraction.extract(source)
-            record, traces = enrichment.enrich(record, traces, source)
+            should_run_llm = self.use_llm and index < self.llm_limit
+            record, traces = enrichment.enrich(record, traces, source, run_llm=should_run_llm)
             if self.research_sources and index < self.research_limit:
                 record, traces, research_meta = self.source_research.enrich_from_sources(record, traces, source)
             else:
@@ -456,6 +492,8 @@ class Orchestrator:
             traceability.append(trace)
             validation_reports.append(report)
             research_results.append(research_meta)
+            if progress_callback and total_rows > 0:
+                progress_callback(index + 1, total_rows)
         errors = [error for report in validation_reports for error in report.errors]
         warnings = [warning for report in validation_reports for warning in report.warnings]
         return {
@@ -469,6 +507,10 @@ class Orchestrator:
                 "rows_researched": min(len(ingestion.rows), self.research_limit) if self.research_sources else 0,
                 "evidence_items": sum(item.get("evidence_count", 0) for item in research_results),
                 "rows": research_results,
+            },
+            "llm_enrichment": {
+                "enabled": self.use_llm,
+                "rows_enriched": min(len(ingestion.rows), self.llm_limit) if self.use_llm else 0,
             },
         }
 
