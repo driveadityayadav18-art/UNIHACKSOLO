@@ -1,0 +1,14 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+python-multipart>=0.0.9
+streamlit>=1.33
+pandas>=2.0
+pypdf>=4.0
+langchain>=0.2
+langchain-openai>=0.1
+langchain-groq>=0.1
+python-dotenv>=1.0
+requests>=2.31
+beautifulsoup4>=4.12
+scikit-learn>=1.4
